@@ -124,6 +124,11 @@ void HoymilesRadio_CMT::loop()
         return;
     }
 
+    if (_threeChannelEnabled) {
+        loopThreeChannel();
+        return;
+    }
+
     if (!_gpio3_configured) {
         if (_radio->rxFifoAvailable()) { // read INT2, PKT_OK flag
             _packetReceived = true;
@@ -187,6 +192,170 @@ void HoymilesRadio_CMT::loop()
     }
 
     handleReceivedPackage();
+}
+
+uint8_t HoymilesRadio_CMT::threeChannelForSlot(const uint8_t slot) const
+{
+    const int8_t offsets[] = { 0, 1, -1 };
+    const int16_t channel = static_cast<int16_t>(_threeChannelControl) + offsets[slot % 3];
+    if (channel < 1 || channel > 0xfe) {
+        return _threeChannelControl;
+    }
+    const uint32_t frequency = getFrequencyFromChannel(static_cast<uint8_t>(channel));
+    const auto& definition = countryDefinition.at(_countryMode);
+    if (frequency < definition.Freq_Legal_Min || frequency > definition.Freq_Legal_Max) {
+        return _threeChannelControl;
+    }
+    return static_cast<uint8_t>(channel);
+}
+
+void HoymilesRadio_CMT::switchThreeChannel(const uint8_t channel)
+{
+    if (_radio->getChannel() == channel) {
+        return;
+    }
+    if (_packetReceived || _radio->rxFifoAvailable()) {
+        _packetReceived = true;
+        return;
+    }
+    _radio->stopListening();
+    _radio->setChannel(channel);
+    if (!_radio->startListening()) {
+        ESP_LOGE(TAG, "CMT 3CH: Failed to start receiver");
+    }
+}
+
+void HoymilesRadio_CMT::observeThreeChannelFragment(const fragment_t& fragment, const uint32_t receivedUs)
+{
+    if (fragment.len < 11 || fragment.fragment[0] != 0x95 || !checkFragmentCrc(fragment)) {
+        return;
+    }
+    const serial_u dtuId = convertSerialToRadioId(_dtuSerial);
+    const uint32_t sender = (static_cast<uint32_t>(fragment.fragment[1]) << 24)
+        | (static_cast<uint32_t>(fragment.fragment[2]) << 16)
+        | (static_cast<uint32_t>(fragment.fragment[3]) << 8) | fragment.fragment[4];
+    if (sender != 0xa02936ec || memcmp(&fragment.fragment[5], &dtuId.b[1], 4) != 0) {
+        return;
+    }
+    const uint8_t fragmentId = fragment.fragment[9] & 0x7f;
+    if (fragmentId == 0 || fragmentId >= MAX_RF_FRAGMENT_COUNT) {
+        return;
+    }
+    uint8_t observedSlot = 0xff;
+    for (uint8_t slot = 0; slot < 3; slot++) {
+        if (fragment.channel == threeChannelForSlot(slot)) {
+            observedSlot = slot;
+            break;
+        }
+    }
+    if (observedSlot == 0xff) {
+        return;
+    }
+    _threeChannelLearnedSlot = (observedSlot + 1) % 3;
+    _threeChannelRxCount++;
+    if (_threeChannelTraceCount < 12) {
+        auto& trace = _threeChannelTrace[_threeChannelTraceCount++];
+        trace.fragmentId = fragmentId;
+        trace.channel = fragment.channel;
+        trace.elapsedUs = receivedUs - _threeChannelStartedUs;
+    }
+    if (!_threeChannelBurst) {
+        return;
+    }
+    _threeChannelPhase = (observedSlot + 3 - ((fragmentId - 1) % 3)) % 3;
+    if ((fragment.fragment[9] & 0x80) != 0) {
+        _threeChannelBurst = false;
+        return;
+    }
+    _threeChannelNextFragment = fragmentId + 1;
+    updateThreeChannelReception();
+}
+
+void HoymilesRadio_CMT::updateThreeChannelReception()
+{
+    if (!_threeChannelBurst) {
+        return;
+    }
+    const uint32_t elapsedUs = static_cast<uint32_t>(micros()) - _threeChannelStartedUs;
+    if (elapsedUs >= _threeChannelWindowUs) {
+        _threeChannelBurst = false;
+        return;
+    }
+    if (_threeChannelPhase == 0xff) {
+        return;
+    }
+    while (_threeChannelNextFragment < MAX_RF_FRAGMENT_COUNT
+        && elapsedUs > 48000U + (_threeChannelNextFragment - 1U) * 50000U + 18000U) {
+        _threeChannelNextFragment++;
+    }
+    if (_threeChannelNextFragment >= MAX_RF_FRAGMENT_COUNT) {
+        _threeChannelBurst = false;
+        return;
+    }
+    switchThreeChannel(threeChannelForSlot((_threeChannelPhase + _threeChannelNextFragment - 1) % 3));
+}
+
+void HoymilesRadio_CMT::loopThreeChannel()
+{
+    if (_radio->rxFifoAvailable()) {
+        _packetReceived = true;
+    }
+    if (!_packetReceived) {
+        updateThreeChannelReception();
+    }
+    if (_packetReceived) {
+        _packetReceived = false;
+        while (_radio->rxFifoAvailable()) {
+            if (_rxBuffer.size() >= FRAGMENT_BUFFER_SIZE) {
+                break;
+            }
+            fragment_t fragment = {};
+            const uint8_t reportedLength = _radio->getDynamicPayloadSize();
+            if (reportedLength == 0) {
+                _radio->flush_rx();
+                break;
+            }
+            fragment.len = std::min<uint8_t>(reportedLength, MAX_RF_PAYLOAD_SIZE);
+            fragment.channel = _radio->getChannel();
+            fragment.rssi = _radio->getRssiDBm();
+            _radio->read(fragment.fragment, fragment.len);
+            if (reportedLength > MAX_RF_PAYLOAD_SIZE) {
+                _radio->flush_rx();
+                continue;
+            }
+            const uint32_t receivedUs = micros();
+            observeThreeChannelFragment(fragment, receivedUs);
+            _rxBuffer.push(fragment);
+        }
+    }
+    while (!_rxBuffer.empty()) {
+        const fragment_t fragment = _rxBuffer.front();
+        _rxBuffer.pop();
+        if (fragment.len < 11 || !checkFragmentCrc(fragment)) {
+            continue;
+        }
+        const serial_u dtuId = convertSerialToRadioId(_dtuSerial);
+        if (memcmp(&fragment.fragment[5], &dtuId.b[1], 4) != 0) {
+            continue;
+        }
+        auto inverter = Hoymiles.getInverterByFragment(fragment);
+        if (inverter != nullptr) {
+            inverter->addRxFragment(fragment.fragment, fragment.len, fragment.rssi);
+        }
+    }
+    updateThreeChannelReception();
+    handleReceivedPackage();
+    if (!_busyFlag) {
+        _threeChannelBurst = false;
+        _threeChannelEnabled = false;
+        ESP_LOGD(TAG, "CMT 3CH summary: %s tx=%" PRIu32 " rx=%" PRIu32,
+            _threeChannelCommand.c_str(), _threeChannelTxCount, _threeChannelRxCount);
+        for (uint8_t index = 0; index < _threeChannelTraceCount; index++) {
+            const auto& trace = _threeChannelTrace[index];
+            ESP_LOGD(TAG, "CMT 3CH RX: fragment=%u listen=%.2f MHz elapsed=%" PRIu32 "us",
+                static_cast<unsigned>(trace.fragmentId), getFrequencyFromChannel(trace.channel) / 1000000.0, trace.elapsedUs);
+        }
+    }
 }
 
 void HoymilesRadio_CMT::setPALevel(const int8_t paLevel)
@@ -285,7 +454,48 @@ void HoymilesRadio_CMT::sendEsbPacket(CommandAbstract& cmd)
 
     cmd.setRouterAddress(DtuSerial().u64);
 
+    const uint8_t* payload = cmd.getDataPayload();
+    const bool threeChannelTarget = cmd.getTargetAddress() == 0x1164A02936ECULL;
+    const uint8_t requestedFragment = payload[9] & 0x7f;
+    const bool fragmentRequest = cmd.getDataSize() == 11 && payload[0] == 0x15
+        && (payload[9] & 0x80) != 0 && requestedFragment > 0 && requestedFragment < MAX_RF_FRAGMENT_COUNT;
+    if (!_busyFlag) {
+        _threeChannelEnabled = threeChannelTarget;
+        if (_threeChannelEnabled) {
+            _threeChannelTxCount = 0;
+            _threeChannelRxCount = 0;
+            _threeChannelTraceCount = 0;
+            _threeChannelRetryFragment = 0;
+            _threeChannelCommand = cmd.getCommandName();
+        }
+    }
+    _threeChannelBurst = false;
+    uint8_t receiveSlot = 0;
+    if (threeChannelTarget) {
+        const uint8_t controlChannel = getChannelFromFrequency(_inverterTargetFrequency);
+        if (controlChannel != _threeChannelControl) {
+            _threeChannelLearnedSlot = 0xff;
+        }
+        _threeChannelControl = controlChannel;
+        if (_threeChannelControl == 0xff) {
+            _threeChannelEnabled = false;
+        } else {
+            _threeChannelTxCount++;
+            if (fragmentRequest) {
+                if (_threeChannelRetryFragment != requestedFragment) {
+                    _threeChannelRetryFragment = requestedFragment;
+                    _threeChannelRetrySlot = _threeChannelLearnedSlot < 3 ? _threeChannelLearnedSlot : 0;
+                }
+                receiveSlot = _threeChannelRetrySlot;
+            } else {
+                _threeChannelRetryFragment = 0;
+                receiveSlot = _threeChannelLearnedSlot < 3 ? _threeChannelLearnedSlot : 0;
+            }
+        }
+    }
     _radio->stopListening();
+    _packetReceived = false;
+    cmtSwitchDtuFreq(_inverterTargetFrequency);
 
     if (cmd.getDataPayload()[0] == 0x56) { // @todo(tbnobody) Bad hack to identify ChannelChange Command
         cmtSwitchDtuFreq(getInvBootFrequency());
@@ -298,7 +508,18 @@ void HoymilesRadio_CMT::sendEsbPacket(CommandAbstract& cmd)
         ESP_LOGE(TAG, "TX SPI Timeout");
     }
     cmtSwitchDtuFreq(_inverterTargetFrequency);
+    if (_threeChannelEnabled) {
+        _radio->setChannel(threeChannelForSlot(receiveSlot));
+    }
     _radio->startListening();
+    if (_threeChannelEnabled) {
+        _threeChannelStartedUs = micros();
+        _threeChannelWindowUs = std::min<uint32_t>(cmd.getTimeout(), 900) * 1000U;
+        _threeChannelPhase = 0xff;
+        _threeChannelNextFragment = 1;
+        _threeChannelBurst = !fragmentRequest && cmd.getDataSize() >= 12
+            && payload[0] == 0x15 && payload[9] == 0x80;
+    }
     _busyFlag = true;
     _rxTimeout.set(cmd.getTimeout());
 }
