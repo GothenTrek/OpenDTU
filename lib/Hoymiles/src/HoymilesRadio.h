@@ -96,4 +96,6 @@ protected:
     bool _busyFlag = false;
 
     TimeoutHelper _rxTimeout;
+    TimeoutHelper _transactionTimeout;
+    static constexpr uint32_t TRANSACTION_TIMEOUT_MS = 30000;
 };

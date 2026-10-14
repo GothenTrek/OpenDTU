@@ -69,6 +69,7 @@ void HoymilesRadio::handleReceivedPackage()
     // fragment of this response can be attributed to the next transaction.
     // The timeout below remains as fallback for incomplete responses.
     bool earlyExit = false;
+    const bool transactionExpired = _busyFlag && _transactionTimeout.occured();
     if (_busyFlag && !_rxTimeout.occured() && isRxBufferEmpty()) {
         std::shared_ptr<InverterAbstract> inv = Hoymiles.getInverterBySerial(_commandQueue.front().get()->getTargetAddress());
         if (nullptr != inv && inv->isTransactionComplete()) {
@@ -77,7 +78,7 @@ void HoymilesRadio::handleReceivedPackage()
         }
     }
 
-    if (_busyFlag && (earlyExit || _rxTimeout.occured())) {
+    if (_busyFlag && (transactionExpired || earlyExit || _rxTimeout.occured())) {
         if (!earlyExit) {
             ESP_LOGI(TAG, "RX Period End");
         }
@@ -85,7 +86,14 @@ void HoymilesRadio::handleReceivedPackage()
 
         if (nullptr != inv) {
             CommandAbstract* cmd = _commandQueue.front().get();
-            uint8_t verifyResult = inv->verifyAllFragments(*cmd);
+            uint8_t verifyResult;
+            if (transactionExpired) {
+                ESP_LOGW(TAG, "Transaction deadline exceeded");
+                cmd->gotTimeout();
+                verifyResult = FRAGMENT_RETRANSMIT_TIMEOUT;
+            } else {
+                verifyResult = inv->verifyAllFragments(*cmd);
+            }
             if (verifyResult == FRAGMENT_ALL_MISSING_RESEND) {
                 ESP_LOGW(TAG, "Nothing received, resend whole request");
                 sendLastPacketAgain();
@@ -157,6 +165,7 @@ void HoymilesRadio::handleReceivedPackage()
                 // Statistics: TX Requests
                 inv->RadioStats.TxRequestData++;
 
+                _transactionTimeout.set(TRANSACTION_TIMEOUT_MS);
                 sendEsbPacket(*cmd);
             } else {
                 ESP_LOGE(TAG, "TX: Invalid inverter found");

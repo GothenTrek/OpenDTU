@@ -134,7 +134,7 @@ private:
     fragment_t _rxFragmentBuffer[MAX_RF_FRAGMENT_COUNT];
     uint8_t _rxFragmentMaxPacketId = 0;
     uint8_t _rxFragmentLastPacketId = 0;
-    uint8_t _rxFragmentRetransmitCnt = 0;
+    uint8_t _rxFragmentRetransmitCnt[MAX_RF_FRAGMENT_COUNT] = {};
 
     bool _enablePolling = true;
     bool _enableCommands = true;

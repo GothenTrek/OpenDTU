@@ -193,7 +193,7 @@ void InverterAbstract::clearRxFragmentBuffer()
     memset(_rxFragmentBuffer, 0, MAX_RF_FRAGMENT_COUNT * sizeof(fragment_t));
     _rxFragmentMaxPacketId = 0;
     _rxFragmentLastPacketId = 0;
-    _rxFragmentRetransmitCnt = 0;
+    memset(_rxFragmentRetransmitCnt, 0, sizeof(_rxFragmentRetransmitCnt));
 }
 
 void InverterAbstract::addRxFragment(const uint8_t fragment[], const uint8_t len, const int8_t rssi)
@@ -268,7 +268,9 @@ uint8_t InverterAbstract::verifyAllFragments(CommandAbstract& cmd)
     // Last fragment is missing (the one with 0x80)
     if (_rxFragmentMaxPacketId == 0) {
         ESP_LOGW(TAG, "Last missing");
-        if (_rxFragmentRetransmitCnt++ < cmd.getMaxRetransmitCount()) {
+        if (_rxFragmentLastPacketId + 1 < MAX_RF_FRAGMENT_COUNT
+            && _rxFragmentRetransmitCnt[_rxFragmentLastPacketId] < cmd.getMaxRetransmitCount()) {
+            _rxFragmentRetransmitCnt[_rxFragmentLastPacketId]++;
             return _rxFragmentLastPacketId + 1;
         } else {
             cmd.gotTimeout();
@@ -280,7 +282,8 @@ uint8_t InverterAbstract::verifyAllFragments(CommandAbstract& cmd)
     for (uint8_t i = 0; i < _rxFragmentMaxPacketId - 1; i++) {
         if (!_rxFragmentBuffer[i].wasReceived) {
             ESP_LOGW(TAG, "Middle missing");
-            if (_rxFragmentRetransmitCnt++ < cmd.getMaxRetransmitCount()) {
+            if (_rxFragmentRetransmitCnt[i] < cmd.getMaxRetransmitCount()) {
+                _rxFragmentRetransmitCnt[i]++;
                 return i + 1;
             } else {
                 cmd.gotTimeout();

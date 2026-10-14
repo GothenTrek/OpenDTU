@@ -71,6 +71,11 @@ private:
     void ARDUINO_ISR_ATTR handleInt2();
 
     void sendEsbPacket(CommandAbstract& cmd);
+    void loopThreeChannel();
+    uint8_t threeChannelForSlot(const uint8_t slot) const;
+    void switchThreeChannel(const uint8_t channel);
+    void observeThreeChannelFragment(const fragment_t& fragment, const uint32_t receivedUs);
+    void updateThreeChannelReception();
 
     // The CMT radio queues received fragments in _rxBuffer which are parsed
     // one per loop iteration in loop().
@@ -89,6 +94,26 @@ private:
 
     uint32_t _inverterTargetFrequency = HOYMILES_CMT_WORK_FREQ;
     int8_t _paLevel = 0;
+
+    bool _threeChannelEnabled = false;
+    bool _threeChannelBurst = false;
+    uint8_t _threeChannelControl = 0;
+    uint8_t _threeChannelPhase = 0xff;
+    uint8_t _threeChannelLearnedSlot = 0xff;
+    uint8_t _threeChannelNextFragment = 1;
+    uint8_t _threeChannelRetryFragment = 0;
+    uint8_t _threeChannelRetrySlot = 0;
+    uint32_t _threeChannelStartedUs = 0;
+    uint32_t _threeChannelWindowUs = 0;
+    uint32_t _threeChannelTxCount = 0;
+    uint32_t _threeChannelRxCount = 0;
+    String _threeChannelCommand;
+    struct {
+        uint8_t fragmentId = 0;
+        uint8_t channel = 0;
+        uint32_t elapsedUs = 0;
+    } _threeChannelTrace[12];
+    uint8_t _threeChannelTraceCount = 0;
 
     bool cmtSwitchDtuFreq(const uint32_t to_frequency);
 
